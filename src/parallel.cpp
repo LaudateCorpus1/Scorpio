@@ -59,8 +59,15 @@ void PROCESSOR::init_mpi(int argc, char* argv[]) {
 }
 
 void PROCESSOR::init_mpi_thread() {
+    /*pvs*/
+    node_pvs.resize(n_hosts);
+    for(int i = 0; i < n_hosts; i++) {
+        node_pvs[i].pv_length = 0;
+        node_pvs[i].pv[0] = 0;
+    }
+    pv_tree_nodes.resize(n_hosts * MAX_PLY);
+    pv_tree_nodes[0] = 0;
     /*global split point*/
-    best_moves.resize(n_hosts);
     global_split = new SPLIT_MESSAGE[n_hosts];
     if(n_hosts > 1)
         message_thread = t_create(check_messages,(void*)0);
@@ -116,14 +123,19 @@ bool PROCESSOR::IProbe(int& source,int& message_id) {
     }
     return false;
 }
-void PROCESSOR::send_best_move(int dest, MOVE move) {
+void PROCESSOR::send_pv(int dest, const PV_MESSAGE& pv) {
     MPI_Request rq;
-    ISend(dest,BMOVE,&move,sizeof(MOVE),&rq);
+    ISend(dest,PV,(void*)&pv,PV_MESSAGE_SIZE(pv),&rq);
     Wait(&rq);
 }
 void PROCESSOR::send_string(const char* str) {
     MPI_Request rq;
     ISend(0,STRING,(void*)&str[0],strlen(str)+1,&rq);
+    Wait(&rq);
+}
+void PROCESSOR::send_init(int dest, const INIT_MESSAGE& init) {
+    MPI_Request rq;
+    ISend(dest,INIT,(void*)&init,INIT_MESSAGE_SIZE(init),&rq);
     Wait(&rq);
 }
 void PROCESSOR::send_cmd(const char* str) {
@@ -346,28 +358,30 @@ void PROCESSOR::handle_message(int source,int message_id) {
         psb->set_board((char*)init.fen);
 
         /*make moves*/
-        int i;
-        for(i = 0;i < init.pv_length;i++) {
+        for(int i = 0;i < init.pv_length;i++) {
             if(init.pv[i]) psb->do_move(init.pv[i]);    
             else psb->do_null();
         }
 
         /*zero best move from all hosts*/
-        for(int i = 0;i < PROCESSOR::n_hosts;i++)
-            PROCESSOR::best_moves[i] = 0;
+        for(int i = 0;i < PROCESSOR::n_hosts;i++) {
+            PROCESSOR::node_pvs[i].pv_length = 0;
+            PROCESSOR::node_pvs[i].pv[0] = 0;
+        }
 
-        /*wakeup processors*/
-        for(i = 0;i < n_processors;i++)
-            PROCESSOR::wait(i);
+        /*wakeup main processor*/
+        PROCESSOR::wait(0);
 
         /***********************************
         * Best move from slave hosts
         ************************************/
-    } else if(message_id == BMOVE) {
-        MOVE move;
-        Recv(source,message_id,&move,sizeof(move));
+    } else if(message_id == PV) {;
+        PV_MESSAGE pv;
+        Recv(source,message_id, &pv, sizeof(PV_MESSAGE));
+        l_lock(lock_smp);
+        PROCESSOR::node_pvs[source] = pv;
+        l_unlock(lock_smp);
 
-        PROCESSOR::best_moves[source] = move;
         /***********************************
         * Any string ,such as PV,from slaves
         ************************************/
@@ -450,8 +464,21 @@ void PROCESSOR::handle_message(int source,int message_id) {
         } else if(message_id == GOROOT) {
             message_available = 0;
             SEARCHER::chess_clock.infinite_mode = true;
+
             processors[0]->state = GO;
+
+            l_lock(lock_smp);
+            PROCESSOR::n_idle_processors--;
+            PROCESSOR::set_num_searchers();
+            l_unlock(lock_smp);
+
             psb->find_best();
+
+            l_lock(lock_smp);
+            PROCESSOR::n_idle_processors++;
+            PROCESSOR::set_num_searchers();
+            l_unlock(lock_smp);
+
             processors[0]->state = PARK;
         } else if(message_id == PONG) {
             pongs++;

@@ -517,22 +517,10 @@ Node* Node::Max_UCB_select(Node* n, bool has_ab, SEARCHER* ps) {
             /*compute Q considering fpu and virtual loss*/
             uct = current->compute_Q(fpu, collision_lev, has_ab);
 
-            float pol = current->policy;
-#ifdef CLUSTER
-            /*double policy of AB best move*/
-            if(is_root && use_abdada_cluster && PROCESSOR::n_hosts > 1) {
-                for(int j = 0;j < PROCESSOR::n_hosts;j++) {
-                    if(j != PROCESSOR::host_id) {
-                        if(current->move == PROCESSOR::best_moves[j])
-                            pol *= 2;
-                    }
-                }
-            }
-#endif
             if(select_formula == 0)
-                uct += factor * (pol / (current->visits + 1));
+                uct += factor * (current->policy / (current->visits + 1));
             else
-                uct += factor * sqrt(pol / (current->visits + 1));
+                uct += factor * sqrt(current->policy / (current->visits + 1));
 
             if(forced_playouts && is_selfplay && is_root && current->visits > 0) {
                 unsigned int n_forced = sqrt(2 * current->policy * n->visits);
@@ -1373,6 +1361,44 @@ FINISH:
     n->dec_busy();
 }
 
+void SEARCHER::unboost_policy() {
+#ifdef CLUSTER
+    if(use_abdada_cluster && PROCESSOR::n_hosts > 1) {
+        for(unsigned int i = 0; i < PROCESSOR::pv_tree_nodes.size(); i++) {
+            Node* nd = PROCESSOR::pv_tree_nodes[i];
+            if(!nd) break;
+            nd->policy /= 2;
+        }
+        PROCESSOR::pv_tree_nodes[0] = 0;
+    }
+#endif
+}
+void SEARCHER::boost_policy() {
+#ifdef CLUSTER
+    if(use_abdada_cluster && PROCESSOR::n_hosts > 1) {
+        unboost_policy();
+        int cnt = 0;
+        for(int j = 0;j < PROCESSOR::n_hosts;j++) {
+            int depth = 0;
+            Node* current = root_node->child;
+            while(current) {
+                if(current->move
+                    && depth < PROCESSOR::node_pvs[j].pv_length
+                    && current->move == PROCESSOR::node_pvs[j].pv[depth]
+                    ) {
+                    depth++;
+                    PROCESSOR::pv_tree_nodes[cnt++] = current;
+                    PROCESSOR::pv_tree_nodes[cnt] = 0;
+                    current->policy *= 2;
+                    current = current->child;
+                } else
+                    current = current->next;
+            }
+        }
+    }
+#endif
+}
+
 /*compute kld b/n network policy and current simulation pi*/
 double SEARCHER::compute_kld() {
     Node* current = root_node->child;
@@ -1417,7 +1443,7 @@ void SEARCHER::compute_time_factor(int rscore) {
         && PROCESSOR::host_id == 0
         ) {
         for(int i = 0; i < PROCESSOR::n_hosts; i++) {
-            MOVE move = PROCESSOR::best_moves[i];
+            MOVE move = PROCESSOR::node_pvs[i].pv[0];
             if(move && move != stack[0].pv[0]) {
                 time_factor *= 2;
                 return;
@@ -1653,6 +1679,7 @@ void SEARCHER::search_mc(bool single, unsigned int nodes_limit) {
                             root_score = logit(root->score);
                             print_pv(root_score);
                             search_depth++;
+                            boost_policy();
                         }
                     }
                     
@@ -1719,6 +1746,8 @@ void SEARCHER::search_mc(bool single, unsigned int nodes_limit) {
         current->clear_dead();
         current = current->next;
     }
+    /*unboost*/
+    unboost_policy();
 }
 /*
 Traverse tree in parallel
@@ -1997,7 +2026,7 @@ float SEARCHER::generate_and_score_moves(int alpha, int beta) {
     if(egbb_is_loaded && all_man_c <= MAX_EGBB) {
         int score, bscore;
 
-        if(probe_bitbases(bscore)) {
+        if(pstack->count && probe_bitbases(bscore)) {
             int bscorem = (bscore >= WIN_SCORE) ? WIN_SCORE :
                        ((bscore <= -WIN_SCORE) ? -WIN_SCORE : 0);
             int legal_moves = 0;
@@ -2018,7 +2047,7 @@ float SEARCHER::generate_and_score_moves(int alpha, int beta) {
                 pstack->score_st[legal_moves] = pstack->score_st[i];
                 legal_moves++;
             }
-            pstack->count = legal_moves;
+            pstack->count = MAX(1,legal_moves);
         }
     }
 

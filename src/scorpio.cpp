@@ -50,13 +50,14 @@ int PROCESSOR::CLUSTER_SPLIT_DEPTH = 8;
 int PROCESSOR::host_id;
 char PROCESSOR::host_name[256];
 std::list<int> PROCESSOR::available_host_workers;
-std::vector<MOVE> PROCESSOR::best_moves;
+std::vector<PV_MESSAGE> PROCESSOR::node_pvs;
+std::vector<Node*> PROCESSOR::pv_tree_nodes;
 int PROCESSOR::help_messages = 0;
 int PROCESSOR::prev_dest = -1;
 int PROCESSOR::vote_weight = 100;
 const char *const PROCESSOR::message_str[] = {
     "QUIT","INIT","HELP","CANCEL","SPLIT","MERGE","PING","PONG",
-    "BMOVE","STRING","STRING_CMD","GOROOT","RECORD_TT","PROBE_TT","PROBE_TT_RESULT"
+    "PV","STRING","STRING_CMD","GOROOT","RECORD_TT","PROBE_TT","PROBE_TT_RESULT"
 };
 int use_abdada_cluster = 0;
 #endif
@@ -66,6 +67,7 @@ static global variables of SEARCHER
 uint64_t SEARCHER::root_nodes[MAX_MOVES];
 int SEARCHER::root_scores[MAX_MOVES];
 CACHE_ALIGN int16_t SEARCHER::history[14][64];
+CACHE_ALIGN int16_t SEARCHER::history_ply[64][6][64];
 CACHE_ALIGN MOVE SEARCHER::refutation[14][64];
 int16_t* SEARCHER::ref_fup_history = 0;
 CHESS_CLOCK SEARCHER::chess_clock;
@@ -114,7 +116,10 @@ load egbbs with a separate thread
 static bool egbb_setting_changed = false;
 static bool ht_setting_changed = false;
 
-static void load_egbbs() {
+static void load_egbbs(bool send = true) {
+    if(send) {
+        CLUSTER_CODE(if(PROCESSOR::host_id == 0) PROCESSOR::send_cmd("load_egbbs");)
+    }
     /*reset hash tables*/
     if(ht_setting_changed) {
         uint64_t size, size_max;
@@ -174,6 +179,9 @@ static void load_egbbs() {
         int end = get_time();
         print("loading_time = %ds\n",(end - start) / 1000);
     }
+
+    /*sync*/
+    CLUSTER_CODE(PROCESSOR::Barrier();)
 }
 /*
 main
@@ -205,14 +213,12 @@ int CDECL main(int argc, char* argv[]) {
     load_ini();
 
     /*
-     * Host 0 waits until all helpers are ready
+     * Add all host workers to list of helpers
      */
 #ifdef CLUSTER
     if(use_abdada_cluster && (PROCESSOR::host_id == 0)) {
-        while(PROCESSOR::available_host_workers.size() + 1 < 
-            (unsigned)PROCESSOR::n_hosts) {
-            t_sleep(100);
-        }
+        for(int i = 1; i < PROCESSOR::n_hosts; i++)
+            PROCESSOR::available_host_workers.push_back(i);
     }
 #endif
 
@@ -221,6 +227,12 @@ int CDECL main(int argc, char* argv[]) {
      */
     strcpy(buffer,"");
     for(int i = 1;i < argc;i++) {
+#ifdef CLUSTER
+        if(PROCESSOR::host_id) {
+            if(!strcmp(argv[i],"xboard") || !strcmp(argv[i],"uci"))
+                continue;
+        }
+#endif
         strcat(buffer," ");
         strcat(buffer,argv[i]);
     }
@@ -233,15 +245,6 @@ int CDECL main(int argc, char* argv[]) {
     /* remove log file if not set*/
     if(!log_on)
         remove_log_file();
-
-    /*
-     * Hosts other than 0 send ready message
-     */
-#ifdef CLUSTER
-    if((PROCESSOR::host_id != 0) && use_abdada_cluster) {
-        PROCESSOR::ISend(0,PROCESSOR::HELP);
-    }
-#endif
 
     /*
      * Host 0 processes command line
@@ -273,9 +276,6 @@ int CDECL main(int argc, char* argv[]) {
         }
 #ifdef  CLUSTER
     } else {
-        /*load egbbs*/
-        load_egbbs();
-
         /* goto wait mode */
         processors[0]->state = PARK;
         search(processors[0]);
@@ -482,9 +482,23 @@ static void print_options() {
 int internal_commands(char** commands,char* command,int& command_num) {
     if (!strcmp(command, "xboard")) {
         PROTOCOL = XBOARD;
-        CLUSTER_CODE(if(PROCESSOR::host_id == 0) PROCESSOR::send_cmd(command);)
         print("feature done=0\n");
-        load_egbbs();
+        print("feature name=1 myname=\"Scorpio %s\"\n",VERSION);
+        print("feature sigint=0 sigterm=0\n");
+        print("feature variants=\"normal,fischerandom\"\n");
+        print("feature setboard=1 usermove=1 draw=0 colors=0\n");
+        print("feature smp=0 memory=0 debug=1\n");
+        print_options();
+        print_search_params();
+        print_mcts_params();
+#ifdef TUNE
+        print_eval_params();
+#endif
+        /*load egbbs*/
+        CLUSTER_CODE(if(PROCESSOR::host_id == 0) PROCESSOR::send_cmd(command);)
+        load_egbbs(false);
+
+        print("feature done=1\n");
     } else if(!strcmp(command,"uci")) {
         PROTOCOL = UCI;
         CLUSTER_CODE(if(PROCESSOR::host_id == 0))
@@ -500,11 +514,14 @@ int internal_commands(char** commands,char* command,int& command_num) {
 #endif
             print("uciok\n");
         }
+        /*load egbbs*/
         CLUSTER_CODE(if(PROCESSOR::host_id == 0) PROCESSOR::send_cmd(command);)
-        load_egbbs();
+        load_egbbs(false);
         /*
         hash tables
         */
+    } else if(!strcmp(command,"load_egbbs")) {
+        load_egbbs(false);
     } else if(!strcmp(command,"ht")) {
         ht = atoi(commands[command_num++]);
         ht_setting_changed = true;
@@ -930,18 +947,6 @@ int internal_commands(char** commands,char* command,int& command_num) {
  */
 int xboard_commands(char** commands,char* command,int& command_num,int& do_search) {
     if (!strcmp(command, "protover")) {
-        print("feature name=1 myname=\"Scorpio %s\"\n",VERSION);
-        print("feature sigint=0 sigterm=0\n");
-        print("feature variants=\"normal,fischerandom\"\n");
-        print("feature setboard=1 usermove=1 draw=0 colors=0\n");
-        print("feature smp=0 memory=0 debug=1\n");
-        print_options();
-        print_search_params();
-        print_mcts_params();
-#ifdef TUNE
-        print_eval_params();
-#endif
-        print("feature done=1\n");
         command_num++;
     } else if (!strcmp(command, "computer")
         || !strcmp(command, "post")

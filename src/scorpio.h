@@ -674,6 +674,10 @@ struct INIT_MESSAGE {
     int32_t pv_length;
     MOVE  pv[127];
 };
+struct PV_MESSAGE {
+    int32_t pv_length;
+    MOVE  pv[MAX_PLY];
+};
 struct TT_MESSAGE {
     uint64_t hash_key;
     int16_t  score;
@@ -687,10 +691,12 @@ struct TT_MESSAGE {
     int16_t  alpha;
     int16_t  beta;
 };
+
 #define   SPLIT_MESSAGE_SIZE(x)   (40 + ((x).pv_length << 2))
 #define   RESPLIT_MESSAGE_SIZE(x) (SPLIT_MESSAGE_SIZE(x) + 4)
 #define   MERGE_MESSAGE_SIZE(x)   (72 + ((x).pv_length << 2))
 #define   INIT_MESSAGE_SIZE(x)    (MAX_FEN_STR + 4 + ((x).pv_length << 2))
+#define   PV_MESSAGE_SIZE(x)      (4 + ((x).pv_length << 2))
 
 #endif
 /*
@@ -835,6 +841,8 @@ typedef struct SEARCHER{
     void  evaluate_moves(int);
     float  generate_and_score_moves(int,int);
     int   Random_select_ab();
+    void  boost_policy();
+    void  unboost_policy();
     /*mcts stuff*/
     void  extract_pv(Node*,bool=false);
     void  create_children(Node*);
@@ -917,6 +925,7 @@ typedef struct SEARCHER{
     static uint64_t root_nodes[MAX_MOVES];
     static int root_scores[MAX_MOVES];
     static int16_t history[14][64];
+    static int16_t history_ply[64][6][64];
     static MOVE refutation[14][64];
     static int16_t* ref_fup_history;
     /*
@@ -1054,6 +1063,7 @@ FORCEINLINE void SEARCHER::POP_NULL() {
 history
 */
 #define HISTORY(move) (history[m_piece(move)][SQ8864(m_to(move))])
+#define HISTORY_PLY(move,ply) (history_ply[ply][PIECE(m_piece(move)) - 1][SQ8864(m_to(move))])
 #define REFUTATION(move) (refutation[m_piece(move)][SQ8864(m_to(move))])
 #define REF_FUP_HISTORY(movec,move) (\
             ref_fup_history[m_piece(movec)*64*14*64 + SQ8864(m_to(movec))*14*64 + \
@@ -1108,7 +1118,7 @@ typedef struct PROCESSOR {
 #ifdef CLUSTER
     enum processor_states {
         QUIT = 0,INIT,HELP,CANCEL,SPLIT,MERGE,PING,PONG,
-        BMOVE,STRING,STRING_CMD,GOROOT,RECORD_TT,PROBE_TT,PROBE_TT_RESULT
+        PV,STRING,STRING_CMD,GOROOT,RECORD_TT,PROBE_TT,PROBE_TT_RESULT
     };
     static const char *const message_str[15];
     static int host_id;
@@ -1117,7 +1127,8 @@ typedef struct PROCESSOR {
     static int prev_dest;
     static std::list<int> available_host_workers;
     static std::atomic_int message_available;
-    static std::vector<MOVE> best_moves;
+    static std::vector<PV_MESSAGE> node_pvs;
+    static std::vector<Node*> pv_tree_nodes;
     static void cancel_idle_hosts();
     static void quit_hosts();
     static void wait_hosts();
@@ -1150,9 +1161,10 @@ typedef struct PROCESSOR {
     static void Gather(char* sendbuf,char* recvbuf,int,int);
     static void handle_message(int dest,int message_id);
     static void offer_help();
-    static void send_best_move(int dest, MOVE move);
+    static void send_pv(int dest, const PV_MESSAGE&);
     static void send_string(const char*);
     static void send_cmd(const char*);
+    static void send_init(int dest, const INIT_MESSAGE&);
 #endif
     bool has_block();
     void idle_loop();

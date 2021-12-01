@@ -4,12 +4,12 @@
 int contempt = 10;
 static int alphabeta_man_c = 12;
 static int multipv = 0;
-
+static int multipv_margin = 100;
 /* search features */
 const int use_nullmove = 1;
 const int use_selective = 1;
 const int use_aspiration = 1;
-const int use_iid = 1;
+const int use_iid = 0;
 const int use_pvs = 1;
 const int use_probcut = 0;
 const int use_singular = 1;
@@ -34,6 +34,9 @@ static PARAM lmr_ntype_count[] = {17, 5, 5};
 /* shared variables */
 static int prev_pv_length = 0;
 int qsearch_level = 0;
+
+static int multipv_count = 0;
+static int multipv_bad = 0;
 
 /*
 * Update pv
@@ -180,6 +183,17 @@ FORCEINLINE int SEARCHER::on_node_entry() {
     /*bitbase cutoff*/
     if(bitbase_cutoff())
         return true;
+
+    /*iid replacement?*/
+    if(!use_iid
+        && !pstack->hash_move
+        && pstack->depth >= 6
+        && pstack->node_type != ALL_NODE
+        ) {
+        pstack->depth--;
+        if(pstack->node_type == PV_NODE)
+            pstack->depth--;
+    }
 
     /*static evaluation of position*/
     if(hply >= 1 && !hstack[hply - 1].checks) {
@@ -334,9 +348,9 @@ FORCEINLINE int SEARCHER::on_qnode_entry() {
 int SEARCHER::is_pawn_push(MOVE move) const {
     if(PIECE(m_piece(move)) == pawn) {
         if(opponent == white) {
-            if(rank(m_from(move)) >= RANK6) return 1;
+            if(rank(m_from(move)) == RANK6) return 1;
         } else {
-            if(rank(m_from(move)) <= RANK3) return 1;
+            if(rank(m_from(move)) == RANK3) return 1;
         }
     }
     return 0;
@@ -397,12 +411,9 @@ int SEARCHER::be_selective(int nmoves, bool mc) {
     /*
     extend
     */
-    if(hstack[hply - 1].checks) {
+    if(hstack[hply - 1].checks || is_pawn_push(move)) {
         if(node_t == PV_NODE) { extend(1); }
         else { extend(0); }
-    }
-    if(is_pawn_push(move)) { 
-        extend(0);
     }
     if(m_capture(move)
         && piece_c[white] + piece_c[black] == 0
@@ -470,6 +481,8 @@ int SEARCHER::be_selective(int nmoves, bool mc) {
             && pstack->depth > 1
             ) { 
             reduce(1);
+            if(node_t == CUT_NODE && pstack->depth > 1)
+                reduce(1);
         }
         //has tt move
         if((pstack-1)->hash_move == (pstack-1)->best_move) {
@@ -840,15 +853,15 @@ IDLE_START:
                     * processor's state loop
                     */
                     if(proc->state <= WAIT) {
-                        l_lock(lock_smp);       
+                        l_lock(lock_smp);
                         PROCESSOR::n_idle_processors++;
                         PROCESSOR::set_num_searchers();
                         l_unlock(lock_smp);
 
                         proc->idle_loop();
 
-                        l_lock(lock_smp);       
-                        PROCESSOR::n_idle_processors--; 
+                        l_lock(lock_smp);    
+                        PROCESSOR::n_idle_processors--;
                         PROCESSOR::set_num_searchers();
                         l_unlock(lock_smp);
                     }
@@ -927,13 +940,13 @@ IDLE_START:
             if(sb->pstack->reduction > 0
                 && score > (sb->pstack - 1)->alpha
                 ) {
-                    sb->pstack->depth++;
-                    sb->pstack->reduction--;
-                    sb->pstack->alpha = -(sb->pstack - 1)->alpha - 1;
-                    sb->pstack->beta = -(sb->pstack - 1)->alpha;
-                    sb->pstack->node_type = CUT_NODE;
-                    sb->pstack->search_state = NULL_MOVE;
-                    goto NEW_NODE;
+                sb->pstack->depth++;
+                sb->pstack->reduction--;
+                sb->pstack->alpha = -(sb->pstack - 1)->alpha - 1;
+                sb->pstack->beta = -(sb->pstack - 1)->alpha;
+                sb->pstack->node_type = CUT_NODE;
+                sb->pstack->search_state = NULL_MOVE;
+                goto NEW_NODE;
             }
             /*research with full window*/
             if((sb->pstack - 1)->node_type == PV_NODE 
@@ -941,11 +954,30 @@ IDLE_START:
                 && score > (sb->pstack - 1)->alpha
                 && score < (sb->pstack - 1)->beta
                 ) {
-                    sb->pstack->alpha = -(sb->pstack - 1)->beta;
-                    sb->pstack->beta = -(sb->pstack - 1)->alpha;
-                    sb->pstack->node_type = PV_NODE;
-                    sb->pstack->search_state = NULL_MOVE;
-                    goto NEW_NODE;
+                sb->pstack->alpha = -(sb->pstack - 1)->beta;
+                sb->pstack->beta = -(sb->pstack - 1)->alpha;
+                sb->pstack->node_type = PV_NODE;
+                sb->pstack->search_state = NULL_MOVE;
+                goto NEW_NODE;
+            }
+            /*check if second/multipv move is weak by a big margin*/
+            if(sb->ply == 1
+                && (sb->pstack - 1)->legal_moves > 1
+                && (sb->pstack - 1)->legal_moves <= 1 + multipv_count
+                && score <= (sb->pstack - 1)->alpha
+                && sb->pstack->beta < -(sb->pstack - 1)->alpha + multipv_margin
+                ) {
+                sb->pstack->alpha = -(sb->pstack - 1)->alpha + multipv_margin - 1;
+                sb->pstack->beta = -(sb->pstack - 1)->alpha + multipv_margin;
+                sb->pstack->node_type = CUT_NODE;
+                sb->pstack->search_state = NULL_MOVE;
+#if 0
+                char mvs[16];
+                mov_strx((sb->pstack - 1)->current_move,mvs);
+                printf("Researching multipv move %s with [%d, %d]\n",
+                    mvs,-sb->pstack->beta,-sb->pstack->alpha);
+#endif
+                goto NEW_NODE;
             }
             sb->POP_MOVE();
             break;
@@ -980,6 +1012,24 @@ IDLE_START:
                           = score;
                 }
                 l_unlock(lock_smp);
+
+                /*check if NN best score (second best) is a blunder*/
+                if(sb->pstack->legal_moves > 1
+                    && sb->pstack->legal_moves <= 1 + multipv_count
+                    ) {
+                    if(score <= sb->pstack->alpha - multipv_margin)
+                        multipv_bad = 1;
+                    else
+                        multipv_bad = 0;
+#if 0
+                    char mv0[16],mv1[16];
+                    mov_strx(move,mv1);
+                    mov_strx(sb->pstack->move_st[0],mv0);
+                    printf("%s alternative %s to main pv %s: %d %d\n",
+                        multipv_bad ? "Bad" : "Ok",
+                        mv1,mv0,score,sb->pstack->alpha);
+#endif
+                }
 #if 0
                 print("%d. %d [%d %d] " FMT64 "\n",
                     sb->pstack->current_index,score,
@@ -1453,6 +1503,8 @@ MOVE SEARCHER::iterative_deepening(bool& montecarlo_skipped) {
     PROCESSOR::age = (hply & AGE_MASK);
     show_full_pv = false;
     freeze_tree = false;
+    multipv_count = 0;
+    multipv_bad = 0;
 
     /*iterative deepening*/
     int alpha,beta,WINDOW = 2*aspiration_window;
@@ -1648,6 +1700,28 @@ MOVE SEARCHER::iterative_deepening(bool& montecarlo_skipped) {
                 }
             }
 
+#ifdef CLUSTER
+            /*install pvs of other nodes*/
+            if(use_abdada_cluster && PROCESSOR::n_hosts > 1) {
+                l_lock(lock_smp);
+                for(int j = 0;j < PROCESSOR::n_hosts;j++) {
+                    if(j != PROCESSOR::host_id) {
+                        int depth = 0;
+                        for(int i = 0;i < PROCESSOR::node_pvs[j].pv_length;i++) {
+                            MOVE mv = PROCESSOR::node_pvs[j].pv[i];
+                            if(is_legal_fast(mv)) {
+                                RECORD_HASH(player,hash_key,0,0,HASH_HIT,0,0,mv,0,0);
+                                PUSH_MOVE(mv);
+                                depth++;
+                            } else break;
+                        }
+                        for(int i = 0;i < depth;i++)
+                            POP_MOVE();
+                    }
+                }
+                l_unlock(lock_smp);
+            }
+#endif
             /*install fake pv into TT table so that it is searched
             first incase it was overwritten*/
             if(pstack->pv_length) {
@@ -1660,6 +1734,7 @@ MOVE SEARCHER::iterative_deepening(bool& montecarlo_skipped) {
             }
 
             /*bias moves found to be best by other hosts and us*/
+            multipv_count = 0;
             uint64_t bests = 0;
             for(int i = 0;i < pstack->count; i++) {
                 MOVE& move = pstack->move_st[i];
@@ -1671,7 +1746,7 @@ MOVE SEARCHER::iterative_deepening(bool& montecarlo_skipped) {
                 else if(use_abdada_cluster && PROCESSOR::n_hosts > 1) {
                     for(int j = 0;j < PROCESSOR::n_hosts;j++) {
                         if(j != PROCESSOR::host_id) {
-                            if(move == PROCESSOR::best_moves[j])
+                            if(move == PROCESSOR::node_pvs[j].pv[0])
                                 root_nodes[i] += (MAX_UINT64 >> 1);
                         }
                     }
@@ -1705,11 +1780,14 @@ MOVE SEARCHER::iterative_deepening(bool& montecarlo_skipped) {
                     root_nodes[i] = bests;
 #ifdef CLUSTER
                 else if(use_abdada_cluster && PROCESSOR::n_hosts > 1) {
-                    if(root_nodes[i] >= (MAX_UINT64 >> 1))
+                    if(root_nodes[i] >= (MAX_UINT64 >> 1)) {
                         root_nodes[i] -= (MAX_UINT64 >> 1);
+                        multipv_count++;
+                    }
                 }
 #endif
             }
+            if(!multipv_count) multipv_bad = 0;
         } else {
             /* Is there enough time to search the first move?*/
             if(rollout_type == ALPHABETA) {
@@ -1875,9 +1953,10 @@ MOVE SEARCHER::find_best() {
         INIT_MESSAGE init;
         get_init_pos(&init);
         for(int i = 0;i < PROCESSOR::n_hosts;i++) {
-            PROCESSOR::best_moves[i] = 0;
+            PROCESSOR::node_pvs[i].pv_length = 0;
+            PROCESSOR::node_pvs[i].pv[0] = 0;
             if(i != PROCESSOR::host_id) {
-                PROCESSOR::ISend(i,PROCESSOR::INIT,&init,INIT_MESSAGE_SIZE(init));
+                PROCESSOR::send_init(i,init);
                 /*start iterative deepening searcher for ABDADA/SHT*/
                 if(use_abdada_cluster || montecarlo)
                     PROCESSOR::ISend(i,PROCESSOR::GOROOT);
@@ -2064,6 +2143,10 @@ MOVE SEARCHER::find_best() {
                 all_man_c <= 16)
                 factor *= 1.5;
 
+            /*NN move is bad with multipv margin*/
+            if(multipv_bad)
+                factor *= 4;
+
             /*compute vote based on subtree size alone*/
             uint64_t maxn = 0;
             for(int i = 1; i < n_root_moves; i++) {
@@ -2227,6 +2310,8 @@ bool check_search_params(char** commands,char* command,int& command_num) {
         alphabeta_man_c = atoi(commands[command_num++]);
     } else if(!strcmp(command, "multipv")) {
         multipv = is_checked(commands[command_num++]);
+    } else if(!strcmp(command, "multipv_margin")) {
+        multipv_margin = atoi(commands[command_num++]);
 #ifdef TUNE
     } else if(!strcmp(command, "aspiration_window")) {
         aspiration_window = atoi(commands[command_num++]);
@@ -2278,4 +2363,5 @@ void print_search_params() {
     print_spin("contempt",contempt,0,100);
     print_spin("alphabeta_man_c",alphabeta_man_c,0,32);
     print_check("multipv",multipv);
+    print_spin("multipv_margin",multipv_margin,0,1000);
 }
